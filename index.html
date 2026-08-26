@@ -328,6 +328,7 @@
     cursor:pointer;
   }
   .btn:hover{ background:var(--accent); border-color:var(--accent); }
+  .btn:disabled{ opacity:.45; cursor:not-allowed; background:var(--ink); border-color:var(--ink); }
   .btn.secondary{ background:var(--white); color:var(--ink); }
   .btn.secondary:hover{ background:var(--white); color:var(--accent); border-color:var(--accent); }
   .btn.small{ padding:7px 12px; font-size:11px; }
@@ -443,7 +444,7 @@
 
 <footer class="wrap">
   <span>© 2026 Boee — PGraphix Studio</span>
-  <button class="admin-trigger" id="admin-trigger" aria-haspopup="dialog">Admin</button>
+  <button type="button" class="admin-trigger" id="admin-trigger" aria-haspopup="dialog" onclick="document.getElementById('admin-overlay').classList.add('open')">Admin</button>
 </footer>
 
 <!-- ===== Admin overlay ===== -->
@@ -454,7 +455,7 @@
     <div id="admin-gate">
       <div class="admin-panel-head">
         <h3>Enter passcode</h3>
-        <button class="admin-close" id="gate-close">Close</button>
+        <button type="button" class="admin-close" id="gate-close" onclick="document.getElementById('admin-overlay').classList.remove('open')">Close</button>
       </div>
       <div class="admin-body">
         <p class="admin-note">The passcode is checked on the server — it's never sent to your browser and isn't in this page's source. A session lasts 2 hours.</p>
@@ -473,10 +474,10 @@
     <div id="admin-form" style="display:none;">
       <div class="admin-panel-head">
         <h3 id="admin-form-title">Add a project</h3>
-        <button class="admin-close" id="form-close">Close</button>
+        <button type="button" class="admin-close" id="form-close" onclick="document.getElementById('admin-overlay').classList.remove('open')">Close</button>
       </div>
       <div class="admin-body">
-        <p class="admin-note">New projects are saved to the server and appear for every visitor immediately — no export or redeploy needed.</p>
+        <p class="admin-note">Projects are saved in KV and new image uploads are stored in Cloudflare R2. Changes appear for visitors immediately — no redeploy needed.</p>
 
         <div class="field-row">
           <div class="field">
@@ -496,9 +497,10 @@
 
         <div class="field">
           <label for="p-images">Images</label>
-          <input type="file" id="p-images" accept="image/*" multiple>
+          <input type="file" id="p-images" accept="image/jpeg,image/png,image/webp,image/gif,image/avif" multiple>
           <div class="thumb-row" id="p-thumbs"></div>
           <p id="image-help" style="font-family:var(--mono); font-size:10.5px; color:var(--grey); margin-top:7px;">Upload one or more images for this project.</p>
+          <p id="image-upload-status" style="display:none; font-family:var(--mono); font-size:10.5px; color:var(--grey); margin-top:7px;"></p>
         </div>
 
         <div class="field">
@@ -628,7 +630,11 @@
 
   trigger.addEventListener('click', openAdmin);
   document.getElementById('gate-close').addEventListener('click', closeAdmin);
-  document.getElementById('form-close').addEventListener('click', closeAdmin);
+  document.getElementById('form-close').addEventListener('click', async () => {
+    await discardUnsavedR2Uploads();
+    resetForm();
+    closeAdmin();
+  });
   overlay.addEventListener('click', (e) => { if (e.target === overlay) closeAdmin(); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAdmin(); });
 
@@ -676,17 +682,108 @@
   }
   document.getElementById('add-spec-row').addEventListener('click', () => addSpecRow());
 
-  // Image upload -> base64 (stored directly in KV alongside the project)
-  document.getElementById('p-images').addEventListener('change', (e) => {
-    const files = Array.from(e.target.files || []);
-    files.forEach(file => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        pendingImages.push(reader.result);
-        renderImageThumbs();
-      };
-      reader.readAsDataURL(file);
+  // ===== R2 image uploads =====
+  // Images are uploaded immediately to the private PORTFOLIO_IMAGES R2 bucket.
+  // KV stores only the lightweight /api/image?key=... URL returned by the server.
+  let activeUploads = 0;
+  let removedR2Keys = [];
+  const newR2Keys = new Set();
+
+  function r2KeyFromImageUrl(src){
+    if (typeof src !== 'string') return null;
+    try {
+      const url = new URL(src, window.location.origin);
+      if (url.pathname !== '/api/image') return null;
+      const key = url.searchParams.get('key');
+      return key && key.startsWith('projects/') ? key : null;
+    } catch(e) {
+      return null;
+    }
+  }
+
+  function setUploadState(){
+    const status = document.getElementById('image-upload-status');
+    const save = document.getElementById('save-project');
+    const picker = document.getElementById('p-images');
+    const busy = activeUploads > 0;
+    save.disabled = busy;
+    picker.disabled = busy;
+    if (busy){
+      status.textContent = `Uploading ${activeUploads} image${activeUploads === 1 ? '' : 's'} to R2…`;
+      status.style.display = 'block';
+    } else {
+      status.style.display = 'none';
+    }
+  }
+
+  async function uploadImageToR2(file){
+    const data = new FormData();
+    data.append('image', file);
+
+    const res = await fetch('/api/image', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + sessionToken },
+      body: data
     });
+
+    let payload = {};
+    try { payload = await res.json(); } catch(e){}
+
+    if (res.status === 401) {
+      sessionToken = null;
+      try { sessionStorage.removeItem('admin_session'); } catch(e){}
+      throw new Error('Your admin session expired. Close the panel, unlock it again, and retry.');
+    }
+    if (!res.ok) throw new Error(payload.error || 'R2 image upload failed.');
+    if (!payload.url || !payload.key) throw new Error('R2 returned an invalid upload response.');
+    return payload;
+  }
+
+  async function deleteR2Image(key){
+    if (!key) return;
+    const res = await fetch('/api/image?key=' + encodeURIComponent(key), {
+      method: 'DELETE',
+      headers: { 'Authorization': 'Bearer ' + sessionToken }
+    });
+    if (!res.ok && res.status !== 404) {
+      let payload = {};
+      try { payload = await res.json(); } catch(e){}
+      throw new Error(payload.error || 'Could not delete an R2 image.');
+    }
+  }
+
+  async function discardUnsavedR2Uploads(){
+    const keys = Array.from(newR2Keys);
+    newR2Keys.clear();
+    if (!keys.length || !sessionToken) return;
+    await Promise.allSettled(keys.map(key => deleteR2Image(key)));
+  }
+
+  document.getElementById('p-images').addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    const errEl = document.getElementById('save-error');
+    errEl.style.display = 'none';
+    if (!files.length) return;
+
+    activeUploads += files.length;
+    setUploadState();
+
+    for (const file of files) {
+      try {
+        const uploaded = await uploadImageToR2(file);
+        pendingImages.push(uploaded.url);
+        newR2Keys.add(uploaded.key);
+        renderImageThumbs();
+      } catch (err) {
+        console.error(err);
+        errEl.textContent = err && err.message ? err.message : 'Could not upload that image to R2.';
+        errEl.style.display = 'block';
+      } finally {
+        activeUploads--;
+        setUploadState();
+      }
+    }
+
     // Allow choosing the same file again after removing it.
     e.target.value = '';
   });
@@ -707,8 +804,19 @@
       remove.className = 'thumb-remove';
       remove.setAttribute('aria-label', `Remove image ${i + 1}`);
       remove.textContent = '×';
-      remove.addEventListener('click', () => {
-        pendingImages.splice(i, 1);
+      remove.addEventListener('click', async () => {
+        const [removed] = pendingImages.splice(i, 1);
+        const key = r2KeyFromImageUrl(removed);
+
+        if (key && newR2Keys.has(key)) {
+          // This upload has never been saved to a project, so remove it from R2 now.
+          newR2Keys.delete(key);
+          try { await deleteR2Image(key); } catch(e) { console.warn(e); }
+        } else if (key && editingIndex !== null) {
+          // Existing R2 image: wait until the project update succeeds before deleting it.
+          if (!removedR2Keys.includes(key)) removedR2Keys.push(key);
+        }
+
         renderImageThumbs();
       });
 
@@ -718,8 +826,8 @@
     });
 
     document.getElementById('image-help').textContent = editingIndex === null
-      ? 'Upload one or more images for this project. Use × to remove a selected image.'
-      : 'Existing images are shown here. Use × to remove one, then upload replacements if needed.';
+      ? 'Choose images and they upload directly to Cloudflare R2. Use × to remove one before saving.'
+      : 'Existing images are shown here. Remove any you want, then choose replacements; new files upload directly to R2.';
   }
 
 
@@ -729,6 +837,8 @@
     document.getElementById('p-images').value = '';
     document.getElementById('spec-rows').innerHTML = '';
     pendingImages = [];
+    removedR2Keys = [];
+    newR2Keys.clear();
     document.getElementById('admin-form-title').textContent = 'Add a project';
     document.getElementById('save-project').textContent = 'Add project';
     document.getElementById('cancel-edit').style.display = 'none';
@@ -741,6 +851,10 @@
     const p = PROJECTS[index];
     if (!p) return;
 
+    // If another form had unsaved R2 uploads, clean those up before switching projects.
+    discardUnsavedR2Uploads();
+    removedR2Keys = [];
+    newR2Keys.clear();
     editingIndex = index;
     document.getElementById('p-unit').value = p.unit || '';
     document.getElementById('p-meta').value = p.meta || '';
@@ -765,13 +879,21 @@
     document.getElementById('p-unit').scrollIntoView({ behavior:'smooth', block:'center' });
   }
 
-  document.getElementById('cancel-edit').addEventListener('click', resetForm);
+  document.getElementById('cancel-edit').addEventListener('click', async () => {
+    await discardUnsavedR2Uploads();
+    resetForm();
+  });
   resetForm();
 
   document.getElementById('save-project').addEventListener('click', async () => {
     const title = document.getElementById('p-title').value.trim();
     const errEl = document.getElementById('save-error');
     errEl.style.display = 'none';
+    if (activeUploads > 0) {
+      errEl.textContent = 'Wait for the image upload to finish before saving.';
+      errEl.style.display = 'block';
+      return;
+    }
     if (!title){ document.getElementById('p-title').focus(); return; }
 
     const specs = Array.from(document.querySelectorAll('.spec-edit-row')).map(row => ({
@@ -809,892 +931,28 @@
         return;
       }
       if (!res.ok){
-        errEl.textContent = editingIndex !== null ? 'Could not update the project. Try again.' : 'Could not save the project. Try again.';
+        let detail = '';
+        try {
+          const data = await res.json();
+          detail = data && data.error ? ' ' + data.error : '';
+        } catch(e){}
+        errEl.textContent = (editingIndex !== null ? 'Could not update the project.' : 'Could not save the project.') + detail;
         errEl.style.display = 'block';
         return;
       }
       PROJECTS = await res.json();
-      renderProjects();
-      renderExisting();
-      resetForm();
-    }catch(e){
-      errEl.textContent = 'Could not reach the server. Try again.';
-      errEl.style.display = 'block';
-    }
-  });
 
-  function renderExisting(){
-    const wrap = document.getElementById('existing-rows');
-    wrap.innerHTML = PROJECTS.map((p, i) => `
-      <div class="existing-row">
-        <span>${escapeHtml(p.unit)} — ${escapeHtml(p.title)}</span>
-        <div class="row-actions">
-          <button class="edit" data-index="${i}">Edit</button>
-          <button class="del" data-index="${i}">Delete</button>
-        </div>
-      </div>
-    `).join("");
-
-    wrap.querySelectorAll('.edit').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const idx = parseInt(btn.getAttribute('data-index'), 10);
-        startEdit(idx);
-      });
-    });
-
-    wrap.querySelectorAll('.del').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const idx = parseInt(btn.getAttribute('data-index'), 10);
-        if (!confirm('Delete this project?')) return;
-        try{
-          const res = await fetch('/api/projects/' + idx, {
-            method: 'DELETE',
-            headers: { 'Authorization': 'Bearer ' + sessionToken }
-          });
-          if (!res.ok) return;
-          PROJECTS = await res.json();
-          renderProjects();
-          renderExisting();
-          if (editingIndex === idx) resetForm();
-          else if (editingIndex !== null && editingIndex > idx) editingIndex--;
-        }catch(e){}
-      });
-    });
-  }
-
-
-  // Download a JSON backup of the current project list (not required to publish —
-  // publishing already happens automatically when you add/delete above).
-  document.getElementById('download-backup').addEventListener('click', () => {
-    const blob = new Blob([JSON.stringify(PROJECTS, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = "projects-backup.json";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  });
-</script>
-
-</body>
-</html><!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Boee — Livery Design / PGraphix Studio</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;700;900&family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --white:#FAFAF8;
-    --ink:#0B0B0C;
-    --grey:#6B6B6B;
-    --line:#E3E2DE;
-    --accent:#D71920;
-    --display:'Archivo Black', 'Archivo', sans-serif;
-    --body:'Archivo', sans-serif;
-    --mono:'IBM Plex Mono', monospace;
-    --max:1240px;
-  }
-  *{box-sizing:border-box; margin:0; padding:0;}
-  html{scroll-behavior:smooth;}
-  @media (prefers-reduced-motion: reduce){
-    html{scroll-behavior:auto;}
-    *{animation-duration:.001ms !important; transition-duration:.001ms !important;}
-  }
-  body{
-    background:var(--white);
-    color:var(--ink);
-    font-family:var(--body);
-    line-height:1.5;
-    -webkit-font-smoothing:antialiased;
-  }
-  a{color:inherit;}
-  img{max-width:100%; display:block;}
-  ::selection{background:var(--ink); color:var(--white);}
-  :focus-visible{outline:3px solid var(--accent); outline-offset:3px;}
-
-  .wrap{max-width:var(--max); margin:0 auto; padding:0 40px;}
-  @media (max-width:640px){ .wrap{padding:0 22px;} }
-
-  /* ===== Header ===== */
-  header{
-    position:sticky; top:0; z-index:50;
-    background:rgba(250,250,248,0.92);
-    backdrop-filter:blur(6px);
-    border-bottom:1px solid var(--line);
-  }
-  .nav{ display:flex; justify-content:space-between; align-items:center; padding:22px 0; }
-  .nav-mark{ font-family:var(--display); font-size:15px; letter-spacing:0.02em; }
-  .nav-mark span{ color:var(--accent); }
-  .nav-links{ display:flex; gap:36px; list-style:none; font-family:var(--mono); font-size:12px; letter-spacing:0.06em; text-transform:uppercase; }
-  .nav-links a{ text-decoration:none; color:var(--ink); position:relative; padding-bottom:3px; }
-  .nav-links a::after{
-    content:""; position:absolute; left:0; right:0; bottom:-2px; height:2px;
-    background:var(--accent); transform:scaleX(0); transform-origin:left; transition:transform .25s ease;
-  }
-  .nav-links a:hover::after{ transform:scaleX(1); }
-  @media (max-width:640px){ .nav-links{ gap:18px; font-size:10px; } }
-
-  /* ===== Hero ===== */
-  .hero{
-    position:relative;
-    min-height:86vh;
-    display:flex;
-    align-items:flex-end;
-    overflow:hidden;
-    border-bottom:1px solid var(--line);
-  }
-  .hero-img{
-    position:absolute; inset:0;
-    background:#0B0B0C url('/img/hero.jpg') center 32% / cover no-repeat;
-  }
-  .hero-img::after{
-    content:"";
-    position:absolute; inset:0;
-    background:linear-gradient(0deg, rgba(0,0,0,0.86) 0%, rgba(0,0,0,0.35) 46%, rgba(0,0,0,0.05) 72%);
-  }
-  .hero-inner{
-    position:relative; z-index:2;
-    width:100%;
-    padding:0 40px 56px;
-    color:var(--white);
-  }
-  @media (max-width:640px){ .hero-inner{ padding:0 22px 40px; } }
-  .hero-eyebrow{
-    font-family:var(--mono); font-size:12px; letter-spacing:0.1em; text-transform:uppercase;
-    color:var(--white); opacity:0.82; margin-bottom:18px;
-    display:flex; align-items:center; gap:10px;
-  }
-  .hero-eyebrow::before{ content:""; width:26px; height:2px; background:var(--accent); }
-  h1.hero-h{
-    font-family:var(--display);
-    font-size:clamp(2.6rem, 8vw, 6.4rem);
-    line-height:0.92;
-    letter-spacing:-0.01em;
-    max-width:14ch;
-    margin-bottom:26px;
-  }
-  .hero-sub{
-    font-size:18px;
-    max-width:46ch;
-    color:rgba(255,255,255,0.86);
-    font-weight:400;
-  }
-
-  /* ===== Section shells ===== */
-  section{ padding:120px 0; }
-  @media (max-width:640px){ section{ padding:76px 0; } }
-
-  .section-head{
-    display:flex; justify-content:space-between; align-items:flex-end;
-    margin-bottom:80px; gap:20px; flex-wrap:wrap;
-  }
-  @media (max-width:640px){ .section-head{ margin-bottom:48px; } }
-  .section-head h2{
-    font-family:var(--display);
-    font-size:clamp(2rem, 5vw, 3.2rem);
-    letter-spacing:-0.01em;
-  }
-  .section-head .meta{
-    font-family:var(--mono); font-size:12px; color:var(--grey);
-    letter-spacing:0.05em; text-transform:uppercase;
-  }
-
-  /* ===== Work / case studies ===== */
-  .case{
-    padding:80px 0;
-    border-top:1px solid var(--line);
-  }
-  .case:last-child{ border-bottom:1px solid var(--line); }
-
-  .case-top{
-    display:flex; justify-content:space-between; align-items:baseline;
-    margin-bottom:36px; gap:20px; flex-wrap:wrap;
-  }
-  .unit-tag{
-    font-family:var(--mono); font-size:13px; color:var(--accent);
-    letter-spacing:0.05em; border:1px solid var(--accent); padding:5px 10px;
-  }
-  .case-meta{
-    font-family:var(--mono); font-size:12px; color:var(--grey); letter-spacing:0.03em;
-  }
-
-  .case-title{
-    font-family:var(--display);
-    font-size:clamp(1.9rem, 4.4vw, 3rem);
-    letter-spacing:-0.01em;
-    margin-bottom:36px;
-    max-width:18ch;
-  }
-
-  .case-grid{
-    display:grid;
-    grid-template-columns:1.15fr 0.85fr;
-    gap:56px;
-    align-items:start;
-  }
-  @media (max-width:900px){ .case-grid{ grid-template-columns:1fr; gap:36px; } }
-
-  .case-gallery{
-    display:grid;
-    grid-template-columns:1fr;
-    gap:14px;
-  }
-  .case-gallery img{
-    width:100%;
-    border:1px solid var(--line);
-  }
-  .case-gallery.two{
-    grid-template-columns:1fr 1fr;
-  }
-  @media (max-width:520px){ .case-gallery.two{ grid-template-columns:1fr; } }
-
-  .case-copy h3{
-    font-family:var(--mono); font-size:11px; text-transform:uppercase;
-    letter-spacing:0.08em; color:var(--accent); margin-bottom:10px; margin-top:26px;
-  }
-  .case-copy h3:first-child{ margin-top:0; }
-  .case-copy p{ color:var(--ink); max-width:52ch; }
-  .case-copy p + p{ margin-top:10px; }
-
-  .spec-list{
-    margin-top:32px;
-    border-top:1px solid var(--line);
-  }
-  .spec-list .row{
-    display:flex; justify-content:space-between;
-    padding:12px 0;
-    border-bottom:1px solid var(--line);
-    font-family:var(--mono); font-size:12.5px;
-  }
-  .spec-list .row .k{ color:var(--grey); text-transform:uppercase; letter-spacing:0.04em; font-size:11px; }
-  .spec-list .row .v{ text-align:right; max-width:60%; }
-
-  /* ===== About ===== */
-  .about-grid{
-    display:grid;
-    grid-template-columns:1fr 1fr;
-    gap:64px;
-  }
-  @media (max-width:820px){ .about-grid{ grid-template-columns:1fr; gap:36px; } }
-  .about-lead{
-    font-family:var(--display);
-    font-size:clamp(1.5rem, 3.4vw, 2.1rem);
-    line-height:1.2;
-    letter-spacing:-0.01em;
-    max-width:16ch;
-  }
-  .about-copy p{ color:var(--grey); max-width:54ch; margin-bottom:16px; }
-  .about-copy p:last-child{ margin-bottom:0; }
-
-  .skill-table{ font-family:var(--mono); font-size:13px; }
-  .skill-row{
-    display:flex; justify-content:space-between;
-    padding:14px 0; border-bottom:1px solid var(--line);
-  }
-  .skill-row:first-child{ border-top:1px solid var(--line); }
-  .skill-row .k{ color:var(--grey); text-transform:uppercase; font-size:11px; letter-spacing:0.05em; }
-  .skill-row .v{ text-align:right; max-width:62%; }
-
-  /* ===== Contact ===== */
-  .contact{
-    border-top:1px solid var(--line);
-    background:var(--ink);
-    color:var(--white);
-  }
-  .contact-inner{
-    display:flex; justify-content:space-between; align-items:flex-end;
-    flex-wrap:wrap; gap:32px;
-  }
-  .contact h2{
-    font-family:var(--display);
-    font-size:clamp(2.2rem, 6vw, 4rem);
-    letter-spacing:-0.01em;
-    max-width:13ch;
-    line-height:1.02;
-  }
-  .contact h2 span{ color:var(--accent); }
-  .contact-links{ display:flex; flex-direction:column; gap:12px; font-family:var(--mono); font-size:15px; }
-  .contact-links a{
-    text-decoration:none; display:inline-flex; align-items:center; gap:8px;
-    border-bottom:1px solid transparent; padding-bottom:2px;
-    transition:border-color .2s ease, color .2s ease;
-  }
-  .contact-links a:hover{ color:var(--accent); border-bottom-color:var(--accent); }
-  .contact-links a .arrow{ transition:transform .2s ease; }
-  .contact-links a:hover .arrow{ transform:translate(2px,-2px); }
-
-  footer{
-    padding:24px 0;
-    background:var(--ink); color:rgba(255,255,255,0.5);
-    font-family:var(--mono); font-size:11px; letter-spacing:0.03em;
-    display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;
-  }
-
-  .reveal{ opacity:0; transform:translateY(16px); transition:opacity .6s ease, transform .6s ease; }
-  .reveal.in{ opacity:1; transform:translateY(0); }
-
-  /* ===== Admin ===== */
-  .admin-trigger{
-    background:none; border:none; color:inherit; font-family:var(--mono);
-    font-size:11px; letter-spacing:0.03em; cursor:pointer; opacity:0.55;
-    text-decoration:underline; text-underline-offset:3px; padding:0;
-  }
-  .admin-trigger:hover{ opacity:1; }
-
-  .admin-overlay{
-    position:fixed; inset:0; z-index:200;
-    background:rgba(11,11,12,0.72);
-    display:none;
-    align-items:flex-start;
-    justify-content:center;
-    overflow-y:auto;
-    padding:60px 20px;
-  }
-  .admin-overlay.open{ display:flex; }
-
-  .admin-panel{
-    background:var(--white);
-    width:100%;
-    max-width:640px;
-    border:1px solid var(--ink);
-    position:relative;
-  }
-  .admin-panel-head{
-    display:flex; justify-content:space-between; align-items:center;
-    padding:20px 24px;
-    border-bottom:1px solid var(--line);
-  }
-  .admin-panel-head h3{
-    font-family:var(--display); font-size:16px; letter-spacing:0.01em;
-  }
-  .admin-close{
-    background:none; border:none; cursor:pointer; font-family:var(--mono);
-    font-size:12px; letter-spacing:0.05em; text-transform:uppercase; color:var(--grey);
-  }
-  .admin-close:hover{ color:var(--ink); }
-  .admin-body{ padding:24px; }
-
-  .field{ margin-bottom:16px; }
-  .field label{
-    display:block; font-family:var(--mono); font-size:11px; text-transform:uppercase;
-    letter-spacing:0.05em; color:var(--grey); margin-bottom:6px;
-  }
-  .field input[type=text], .field input[type=password], .field textarea{
-    width:100%; padding:10px 12px; border:1px solid var(--line); background:var(--white);
-    font-family:var(--body); font-size:14px; color:var(--ink); resize:vertical;
-  }
-  .field textarea{ min-height:64px; }
-  .field input:focus, .field textarea:focus{ outline:2px solid var(--accent); outline-offset:1px; border-color:var(--accent); }
-
-  .field-row{ display:flex; gap:12px; }
-  .field-row .field{ flex:1; }
-
-  .spec-edit-row{ display:flex; gap:8px; margin-bottom:8px; }
-  .spec-edit-row input{ flex:1; }
-  .row-remove{
-    background:none; border:1px solid var(--line); cursor:pointer; padding:0 10px;
-    font-family:var(--mono); font-size:14px; color:var(--grey);
-  }
-  .row-remove:hover{ color:var(--accent); border-color:var(--accent); }
-
-  .btn{
-    font-family:var(--mono); font-size:12px; letter-spacing:0.05em; text-transform:uppercase;
-    padding:10px 16px; border:1px solid var(--ink); background:var(--ink); color:var(--white);
-    cursor:pointer;
-  }
-  .btn:hover{ background:var(--accent); border-color:var(--accent); }
-  .btn.secondary{ background:var(--white); color:var(--ink); }
-  .btn.secondary:hover{ background:var(--white); color:var(--accent); border-color:var(--accent); }
-  .btn.small{ padding:7px 12px; font-size:11px; }
-
-  .admin-actions{ display:flex; gap:10px; flex-wrap:wrap; margin-top:18px; }
-
-  .admin-note{
-    font-family:var(--mono); font-size:11px; color:var(--grey); line-height:1.6;
-    background:var(--white); border:1px dashed var(--line); padding:12px; margin-bottom:20px;
-  }
-
-  .existing-list{ margin-top:28px; border-top:1px solid var(--line); padding-top:16px; }
-  .existing-row{
-    display:flex; justify-content:space-between; align-items:center; gap:10px;
-    padding:10px 0; border-bottom:1px solid var(--line); font-family:var(--mono); font-size:12.5px;
-  }
-  .existing-row .del{
-    background:none; border:1px solid var(--line); color:var(--grey); cursor:pointer;
-    padding:4px 9px; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;
-  }
-  .existing-row .del:hover{ color:var(--accent); border-color:var(--accent); }
-
-  .thumb-row{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
-  .thumb-row img{ width:64px; height:64px; object-fit:cover; border:1px solid var(--line); }
-  .thumb-item{ position:relative; width:64px; height:64px; }
-  .thumb-item img{ width:64px; height:64px; object-fit:cover; border:1px solid var(--line); }
-  .thumb-remove{
-    position:absolute; top:3px; right:3px; width:22px; height:22px; border:1px solid rgba(255,255,255,.7);
-    background:rgba(11,11,12,.82); color:#fff; cursor:pointer; font-family:var(--mono); font-size:14px;
-    line-height:18px; display:flex; align-items:center; justify-content:center;
-  }
-  .thumb-remove:hover{ background:var(--accent); }
-  .existing-row .row-actions{ display:flex; gap:6px; }
-  .existing-row .edit{
-    background:none; border:1px solid var(--line); color:var(--grey); cursor:pointer;
-    padding:4px 9px; font-size:11px; text-transform:uppercase; letter-spacing:0.04em;
-  }
-  .existing-row .edit:hover{ color:var(--ink); border-color:var(--ink); }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="wrap nav">
-    <div class="nav-mark">BOEE <span>/</span> PGRAPHIX STUDIO</div>
-    <ul class="nav-links">
-      <li><a href="#work">Work</a></li>
-      <li><a href="#about">About</a></li>
-      <li><a href="#contact">Contact</a></li>
-    </ul>
-  </div>
-</header>
-
-<main>
-  <!-- HERO -->
-  <div class="hero">
-    <div class="hero-img"></div>
-    <div class="hero-inner">
-      <p class="hero-eyebrow">Livery Designer — PGraphix Studio</p>
-      <h1 class="hero-h">Every panel is a canvas.</h1>
-      <p class="hero-sub">Full-vehicle livery design for FiveM emergency fleets — from reference and badge work to game-ready textures.</p>
-    </div>
-  </div>
-
-  <!-- WORK -->
-  <section id="work">
-    <div class="wrap">
-      <div class="section-head reveal">
-        <h2>Selected liveries</h2>
-        <span class="meta" id="work-count">03 units, built start to finish</span>
-      </div>
-
-      <div id="case-list"></div>
-
-    </div>
-  </section>
-
-  <!-- ABOUT -->
-  <section id="about" style="background:var(--white); border-top:1px solid var(--line);">
-    <div class="wrap">
-      <div class="section-head reveal">
-        <h2>About</h2>
-        <span class="meta">Background</span>
-      </div>
-      <div class="about-grid reveal">
-        <div class="about-lead">Livery design, built the way a real fleet graphics shop would build it.</div>
-        <div class="about-copy">
-          <p>I'm Boee, a livery designer at PGraphix Studio. I design full vehicle liveries for lore-friendly emergency departments — sheriff's offices, highway patrol, and everything in between — start to finish, from reference research to the final game-ready texture file.</p>
-          <p>Every project starts the same way: study how the real-world department (or the one it's inspired by) actually lays out its graphics, then rebuild that logic — badges, striping, door copy, unit numbers — panel by panel against the vehicle's own template.</p>
-        </div>
-        <div class="skill-table" style="grid-column:1/-1; max-width:640px;">
-          <div class="skill-row"><span class="k">Software</span><span class="v">Photoshop, Illustrator</span></div>
-          <div class="skill-row"><span class="k">Focus</span><span class="v">Lore-friendly emergency vehicle liveries</span></div>
-          <div class="skill-row"><span class="k">Output</span><span class="v">Game-ready texture / livery templates (FiveM)</span></div>
-          <div class="skill-row"><span class="k">Studio</span><span class="v">PGraphix Studio</span></div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- CONTACT -->
-  <section id="contact" class="contact">
-    <div class="wrap contact-inner reveal">
-      <h2>Need a livery <span>built right?</span></h2>
-      <div class="contact-links">
-        <a href="#">boee@boee.fyi <span class="arrow">↗</span></a>
-        <a href="#">Discord: 8oe3 <span class="arrow">↗</span></a>
-        <a href="#">https://discord.gg/xDmbaY4QjY <span class="arrow">↗</span></a>
-      </div>
-    </div>
-  </section>
-</main>
-
-<footer class="wrap">
-  <span>© 2026 Boee — PGraphix Studio</span>
-  <button class="admin-trigger" id="admin-trigger" aria-haspopup="dialog">Admin</button>
-</footer>
-
-<!-- ===== Admin overlay ===== -->
-<div class="admin-overlay" id="admin-overlay" role="dialog" aria-modal="true" aria-label="Admin panel">
-  <div class="admin-panel">
-
-    <!-- Passcode gate -->
-    <div id="admin-gate">
-      <div class="admin-panel-head">
-        <h3>Enter passcode</h3>
-        <button class="admin-close" id="gate-close">Close</button>
-      </div>
-      <div class="admin-body">
-        <p class="admin-note">The passcode is checked on the server — it's never sent to your browser and isn't in this page's source. A session lasts 2 hours.</p>
-        <div class="field">
-          <label for="passcode-input">Passcode</label>
-          <input type="password" id="passcode-input" autocomplete="off">
-        </div>
-        <p id="gate-error" style="display:none; color:var(--accent); font-family:var(--mono); font-size:12px; margin-bottom:12px;">Wrong passcode. Try again.</p>
-        <div class="admin-actions">
-          <button class="btn" id="gate-submit">Unlock</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Admin form (shown after unlock) -->
-    <div id="admin-form" style="display:none;">
-      <div class="admin-panel-head">
-        <h3 id="admin-form-title">Add a project</h3>
-        <button class="admin-close" id="form-close">Close</button>
-      </div>
-      <div class="admin-body">
-        <p class="admin-note">New projects are saved to the server and appear for every visitor immediately — no export or redeploy needed.</p>
-
-        <div class="field-row">
-          <div class="field">
-            <label for="p-unit">Unit tag</label>
-            <input type="text" id="p-unit" placeholder="UNIT — 04">
-          </div>
-          <div class="field">
-            <label for="p-meta">Agency / meta line</label>
-            <input type="text" id="p-meta" placeholder="Department name · short tag">
-          </div>
-        </div>
-
-        <div class="field">
-          <label for="p-title">Title</label>
-          <input type="text" id="p-title" placeholder="Project title">
-        </div>
-
-        <div class="field">
-          <label for="p-images">Images</label>
-          <input type="file" id="p-images" accept="image/*" multiple>
-          <div class="thumb-row" id="p-thumbs"></div>
-          <p id="image-help" style="font-family:var(--mono); font-size:10.5px; color:var(--grey); margin-top:7px;">Upload one or more images for this project.</p>
-        </div>
-
-        <div class="field">
-          <label for="p-brief">Brief</label>
-          <textarea id="p-brief" placeholder="What the project needed to do."></textarea>
-        </div>
-        <div class="field">
-          <label for="p-process">Process</label>
-          <textarea id="p-process" placeholder="How you built it."></textarea>
-        </div>
-        <div class="field">
-          <label for="p-delivery">Delivery</label>
-          <textarea id="p-delivery" placeholder="What you shipped, in what format."></textarea>
-        </div>
-
-        <div class="field">
-          <label>Spec rows</label>
-          <div id="spec-rows"></div>
-          <button class="btn secondary small" id="add-spec-row" type="button">+ Add spec row</button>
-        </div>
-
-        <div class="admin-actions">
-          <button class="btn" id="save-project">Add project</button>
-          <button class="btn secondary" id="cancel-edit" type="button" style="display:none;">Cancel edit</button>
-          <button class="btn secondary" id="download-backup">Download backup (JSON)</button>
-        </div>
-        <p id="save-error" style="display:none; color:var(--accent); font-family:var(--mono); font-size:12px; margin-top:10px;"></p>
-
-        <div class="existing-list" id="existing-list">
-          <label style="display:block; font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--grey); margin-bottom:10px;">Current projects</label>
-          <div id="existing-rows"></div>
-        </div>
-      </div>
-    </div>
-
-  </div>
-</div>
-
-<script>
-  // ===== Live data, fetched from the server (Cloudflare Pages Functions + KV) =====
-  let PROJECTS = [];
-  let sessionToken = null; // session-only, held in memory + sessionStorage, never localStorage
-
-  function escapeHtml(str){
-    const div = document.createElement('div');
-    div.textContent = str == null ? "" : String(str);
-    return div.innerHTML;
-  }
-
-  function renderProjects(){
-    const list = document.getElementById('case-list');
-    const countEl = document.getElementById('work-count');
-    countEl.textContent = String(PROJECTS.length).padStart(2,'0') + " units, built start to finish";
-
-    list.innerHTML = PROJECTS.map(p => {
-      const galleryClass = p.images && p.images.length > 1 ? "case-gallery two" : "case-gallery";
-      const imgs = (p.images || []).map(src =>
-        `<img src="${escapeHtml(src)}" alt="${escapeHtml(p.title)}">`
-      ).join("");
-      const specs = (p.specs || []).map(s =>
-        `<div class="row"><span class="k">${escapeHtml(s.k)}</span><span class="v">${escapeHtml(s.v)}</span></div>`
-      ).join("");
-      return `
-        <div class="case reveal in">
-          <div class="case-top">
-            <span class="unit-tag">${escapeHtml(p.unit)}</span>
-            <span class="case-meta">${escapeHtml(p.meta)}</span>
-          </div>
-          <h3 class="case-title">${escapeHtml(p.title)}</h3>
-          <div class="case-grid">
-            <div class="${galleryClass}">${imgs}</div>
-            <div class="case-copy">
-              <h3>Brief</h3>
-              <p>${escapeHtml(p.brief)}</p>
-              <h3>Process</h3>
-              <p>${escapeHtml(p.process)}</p>
-              <h3>Delivery</h3>
-              <p>${escapeHtml(p.delivery)}</p>
-              <div class="spec-list">${specs}</div>
-            </div>
-          </div>
-        </div>`;
-    }).join("");
-  }
-
-  async function loadProjects(){
-    try{
-      const res = await fetch('/api/projects');
-      if (!res.ok) throw new Error('Failed to load projects');
-      PROJECTS = await res.json();
-    }catch(e){
-      console.error(e);
-      PROJECTS = [];
-    }
-    renderProjects();
-  }
-
-  loadProjects();
-
-  // Scroll reveal for everything except freshly-rendered cases (already .in)
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        entry.target.classList.add('in');
-        observer.unobserve(entry.target);
+      // The project update is safely stored. Now remove R2 files that were taken
+      // out of the edited project. Failed cleanup only leaves an unused object;
+      // it does not break the saved project.
+      const cleanupKeys = removedR2Keys.slice();
+      removedR2Keys = [];
+      if (cleanupKeys.length) {
+        Promise.allSettled(cleanupKeys.map(key => deleteR2Image(key)));
       }
-    });
-  }, { threshold: 0.1 });
-  document.querySelectorAll('.reveal:not(.in)').forEach(el => observer.observe(el));
 
-  // ===== Admin panel =====
-  const overlay = document.getElementById('admin-overlay');
-  const gate = document.getElementById('admin-gate');
-  const form = document.getElementById('admin-form');
-  const trigger = document.getElementById('admin-trigger');
-  let pendingImages = []; // image URLs/data URLs currently in the form
-  let editingIndex = null; // null = adding, number = editing an existing project
-
-  try { sessionToken = sessionStorage.getItem('admin_session'); } catch(e){}
-
-  function openAdmin(){
-    overlay.classList.add('open');
-    if (sessionToken){ gate.style.display = 'none'; form.style.display = 'block'; renderExisting(); }
-    else { gate.style.display = 'block'; form.style.display = 'none'; document.getElementById('passcode-input').focus(); }
-  }
-  function closeAdmin(){ overlay.classList.remove('open'); }
-
-  trigger.addEventListener('click', openAdmin);
-  document.getElementById('gate-close').addEventListener('click', closeAdmin);
-  document.getElementById('form-close').addEventListener('click', closeAdmin);
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeAdmin(); });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAdmin(); });
-
-  async function tryUnlock(){
-    const val = document.getElementById('passcode-input').value;
-    const errEl = document.getElementById('gate-error');
-    errEl.style.display = 'none';
-    try{
-      const res = await fetch('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passcode: val })
-      });
-      if (!res.ok){
-        errEl.textContent = 'Wrong passcode. Try again.';
-        errEl.style.display = 'block';
-        return;
-      }
-      const data = await res.json();
-      sessionToken = data.token;
-      try { sessionStorage.setItem('admin_session', sessionToken); } catch(e){}
-      gate.style.display = 'none';
-      form.style.display = 'block';
-      renderExisting();
-    }catch(e){
-      errEl.textContent = 'Could not reach the server. Try again.';
-      errEl.style.display = 'block';
-    }
-  }
-  document.getElementById('gate-submit').addEventListener('click', tryUnlock);
-  document.getElementById('passcode-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryUnlock(); });
-
-  // Spec rows
-  function addSpecRow(k, v){
-    const wrap = document.getElementById('spec-rows');
-    const row = document.createElement('div');
-    row.className = 'spec-edit-row';
-    row.innerHTML = `
-      <input type="text" class="spec-k" placeholder="Label" value="${escapeHtml(k||'')}">
-      <input type="text" class="spec-v" placeholder="Value" value="${escapeHtml(v||'')}">
-      <button type="button" class="row-remove" aria-label="Remove row">×</button>
-    `;
-    row.querySelector('.row-remove').addEventListener('click', () => row.remove());
-    wrap.appendChild(row);
-  }
-  document.getElementById('add-spec-row').addEventListener('click', () => addSpecRow());
-
-  // Image upload -> base64 (stored directly in KV alongside the project)
-  document.getElementById('p-images').addEventListener('change', (e) => {
-    const files = Array.from(e.target.files || []);
-    files.forEach(file => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        pendingImages.push(reader.result);
-        renderImageThumbs();
-      };
-      reader.readAsDataURL(file);
-    });
-    // Allow choosing the same file again after removing it.
-    e.target.value = '';
-  });
-
-  function renderImageThumbs(){
-    const thumbs = document.getElementById('p-thumbs');
-    thumbs.innerHTML = '';
-    pendingImages.forEach((src, i) => {
-      const item = document.createElement('div');
-      item.className = 'thumb-item';
-
-      const img = document.createElement('img');
-      img.src = src;
-      img.alt = `Project image ${i + 1}`;
-
-      const remove = document.createElement('button');
-      remove.type = 'button';
-      remove.className = 'thumb-remove';
-      remove.setAttribute('aria-label', `Remove image ${i + 1}`);
-      remove.textContent = '×';
-      remove.addEventListener('click', () => {
-        pendingImages.splice(i, 1);
-        renderImageThumbs();
-      });
-
-      item.appendChild(img);
-      item.appendChild(remove);
-      thumbs.appendChild(item);
-    });
-
-    document.getElementById('image-help').textContent = editingIndex === null
-      ? 'Upload one or more images for this project. Use × to remove a selected image.'
-      : 'Existing images are shown here. Use × to remove one, then upload replacements if needed.';
-  }
-
-
-  function resetForm(){
-    editingIndex = null;
-    ['p-unit','p-meta','p-title','p-brief','p-process','p-delivery'].forEach(id => document.getElementById(id).value = '');
-    document.getElementById('p-images').value = '';
-    document.getElementById('spec-rows').innerHTML = '';
-    pendingImages = [];
-    document.getElementById('admin-form-title').textContent = 'Add a project';
-    document.getElementById('save-project').textContent = 'Add project';
-    document.getElementById('cancel-edit').style.display = 'none';
-    addSpecRow('Software', 'Photoshop, Illustrator');
-    addSpecRow('Output', 'FiveM livery template');
-    renderImageThumbs();
-  }
-
-  function startEdit(index){
-    const p = PROJECTS[index];
-    if (!p) return;
-
-    editingIndex = index;
-    document.getElementById('p-unit').value = p.unit || '';
-    document.getElementById('p-meta').value = p.meta || '';
-    document.getElementById('p-title').value = p.title || '';
-    document.getElementById('p-brief').value = p.brief || '';
-    document.getElementById('p-process').value = p.process || '';
-    document.getElementById('p-delivery').value = p.delivery || '';
-    document.getElementById('p-images').value = '';
-
-    pendingImages = Array.isArray(p.images) ? p.images.slice() : [];
-    renderImageThumbs();
-
-    const specWrap = document.getElementById('spec-rows');
-    specWrap.innerHTML = '';
-    (p.specs || []).forEach(spec => addSpecRow(spec.k || '', spec.v || ''));
-    if (!(p.specs || []).length) addSpecRow();
-
-    document.getElementById('admin-form-title').textContent = 'Edit project';
-    document.getElementById('save-project').textContent = 'Save changes';
-    document.getElementById('cancel-edit').style.display = 'inline-block';
-    document.getElementById('save-error').style.display = 'none';
-    document.getElementById('p-unit').scrollIntoView({ behavior:'smooth', block:'center' });
-  }
-
-  document.getElementById('cancel-edit').addEventListener('click', resetForm);
-  resetForm();
-
-  document.getElementById('save-project').addEventListener('click', async () => {
-    const title = document.getElementById('p-title').value.trim();
-    const errEl = document.getElementById('save-error');
-    errEl.style.display = 'none';
-    if (!title){ document.getElementById('p-title').focus(); return; }
-
-    const specs = Array.from(document.querySelectorAll('.spec-edit-row')).map(row => ({
-      k: row.querySelector('.spec-k').value.trim(),
-      v: row.querySelector('.spec-v').value.trim()
-    })).filter(s => s.k || s.v);
-
-    const project = {
-      unit: document.getElementById('p-unit').value.trim() || `UNIT — ${String(PROJECTS.length+1).padStart(2,'0')}`,
-      meta: document.getElementById('p-meta').value.trim(),
-      title: title,
-      images: pendingImages.slice(),
-      brief: document.getElementById('p-brief').value.trim(),
-      process: document.getElementById('p-process').value.trim(),
-      delivery: document.getElementById('p-delivery').value.trim(),
-      specs: specs
-    };
-
-    try{
-      const isEditing = editingIndex !== null;
-      const endpoint = isEditing ? '/api/projects/' + editingIndex : '/api/projects';
-      const res = await fetch(endpoint, {
-        method: isEditing ? 'PUT' : 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + sessionToken
-        },
-        body: JSON.stringify(project)
-      });
-      if (res.status === 401){
-        errEl.textContent = 'Your session expired — close this panel and unlock it again.';
-        errEl.style.display = 'block';
-        sessionToken = null;
-        try { sessionStorage.removeItem('admin_session'); } catch(e){}
-        return;
-      }
-      if (!res.ok){
-        errEl.textContent = editingIndex !== null ? 'Could not update the project. Try again.' : 'Could not save the project. Try again.';
-        errEl.style.display = 'block';
-        return;
-      }
-      PROJECTS = await res.json();
+      // Newly-uploaded R2 images are now referenced by the saved project.
+      newR2Keys.clear();
       renderProjects();
       renderExisting();
       resetForm();
