@@ -12,6 +12,18 @@ function getProjectIndex(params) {
   return parseInt(params.id, 10);
 }
 
+function r2KeyFromImageUrl(src) {
+  if (typeof src !== "string") return null;
+  try {
+    const url = new URL(src, "https://portfolio.invalid");
+    if (url.pathname !== "/api/image") return null;
+    const key = url.searchParams.get("key");
+    return key && key.startsWith("projects/") ? key : null;
+  } catch {
+    return null;
+  }
+}
+
 // PUT /api/projects/:id -> replace an existing project (requires admin session)
 export async function onRequestPut(context) {
   const { request, env, params } = context;
@@ -38,13 +50,18 @@ export async function onRequestPut(context) {
   }
 
   projects[idx] = project;
-  await env.PORTFOLIO_KV.put(KV_KEY, JSON.stringify(projects));
+
+  try {
+    await env.PORTFOLIO_KV.put(KV_KEY, JSON.stringify(projects));
+  } catch (err) {
+    console.error("KV update failed", err);
+    return jsonResponse({ error: "Cloudflare KV rejected the project update" }, 500);
+  }
 
   return jsonResponse(projects);
 }
 
-// DELETE /api/projects/:id -> requires a valid session token from /api/login
-// :id is the project's index in the array.
+// DELETE /api/projects/:id -> remove the project and its R2-hosted images.
 export async function onRequestDelete(context) {
   const { request, env, params } = context;
 
@@ -58,8 +75,20 @@ export async function onRequestDelete(context) {
     return jsonResponse({ error: "Project not found" }, 404);
   }
 
-  projects.splice(idx, 1);
+  const [removed] = projects.splice(idx, 1);
   await env.PORTFOLIO_KV.put(KV_KEY, JSON.stringify(projects));
+
+  // Best-effort R2 cleanup. Static /img paths and legacy base64 images are ignored.
+  if (env.PORTFOLIO_IMAGES && removed && Array.isArray(removed.images)) {
+    const keys = removed.images.map(r2KeyFromImageUrl).filter(Boolean);
+    if (keys.length) {
+      try {
+        await env.PORTFOLIO_IMAGES.delete(keys);
+      } catch (err) {
+        console.error("R2 cleanup after project delete failed", err);
+      }
+    }
+  }
 
   return jsonResponse(projects);
 }
