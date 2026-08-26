@@ -34,7 +34,13 @@ export async function onRequestPost(context) {
 
   const projects = await getProjects(env);
   projects.push(project);
-  await env.PORTFOLIO_KV.put(KV_KEY, JSON.stringify(projects));
+
+  try {
+    await env.PORTFOLIO_KV.put(KV_KEY, JSON.stringify(projects));
+  } catch (err) {
+    console.error("KV save failed", err);
+    return jsonResponse({ error: "Cloudflare KV rejected the project save" }, 500);
+  }
 
   return jsonResponse(projects);
 }
