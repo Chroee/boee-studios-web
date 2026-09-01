@@ -47,12 +47,62 @@
   :focus-visible{ outline:3px solid var(--focus); outline-offset:3px; }
 
   /* ============================================================
+     Intro — a full-height title card the visitor sees before the
+     sidebar ever appears. As it scrolls past, it slides left — off
+     to make room — while the sidebar slides in from that same edge,
+     both driven by one live --intro-progress value the small script
+     below sets from actual scroll position (not a scrollbar hijack,
+     just a CSS variable kept in sync). Sidebar defaults to fully
+     visible with no JS — this is a reveal, not a gate.
+     ============================================================ */
+  .intro{
+    position:relative; min-height:100vh; min-height:100svh;
+    display:flex; flex-direction:column; justify-content:flex-end;
+    padding:3rem; color:#F3F1E7; overflow:hidden;
+    transform:translateX(calc(var(--intro-progress, 0) * -30%));
+    opacity:calc(1 - var(--intro-progress, 0));
+  }
+  .intro-bg{
+    position:absolute; inset:0; z-index:-1;
+    background:#0a0a08 url('/img/hero.jpg') center 38% / cover no-repeat;
+  }
+  .intro-bg::after{
+    content:""; position:absolute; inset:0;
+    background:linear-gradient(180deg, rgba(8,8,6,.32) 0%, rgba(8,8,6,.58) 55%, rgba(6,6,5,.9) 100%);
+  }
+  .intro-eyebrow{ font-size:0.9rem; color:rgba(243,241,231,.75); margin-bottom:1rem; }
+  .intro h1{
+    font-size:clamp(3.2rem, 11vw, 8rem); font-weight:800;
+    letter-spacing:-0.02em; line-height:0.95;
+  }
+  .intro p{
+    font-size:1.1rem; max-width:34ch; margin-top:1.3rem;
+    color:rgba(243,241,231,.85);
+  }
+  @media (max-width:700px){
+    .intro{ padding:1.6rem; }
+  }
+
+  /* ============================================================
      Layout — a fixed photo sidebar (identity, nav, contact) beside
      a plain scrolling column for the work itself. Not a hero banner
      + stacked marketing sections; closer to how a working designer
      actually lays out a portfolio when the images are the pitch.
      ============================================================ */
   .page{ display:flex; min-height:100vh; }
+  .sidebar{
+    /* A hard-edged wipe, not a cross-fade — two translucent photos
+       overlapping just muddies into gray. This grows in from the
+       left as one opaque block, so it's always either fully there
+       or not there, never ghosting through the card behind it. */
+    clip-path:inset(0 calc((1 - var(--intro-progress, 1)) * 100%) 0 0);
+  }
+  body.intro-visible .sidebar{ pointer-events:none; }
+  @media (prefers-reduced-motion: reduce){
+    /* Keep the wipe (it's a hard cut, not motion in the vestibular
+       sense), drop the card's slide. */
+    .intro{ transform:none; }
+  }
 
   .sidebar{
     position:fixed; top:0; left:0; bottom:0; width:var(--sidebar-w);
@@ -309,6 +359,13 @@
 </style>
 </head>
 <body>
+
+<section class="intro">
+  <div class="intro-bg" aria-hidden="true"></div>
+  <p class="intro-eyebrow">PGraphix Studio</p>
+  <h1>Boee</h1>
+  <p>Livery design for lore-friendly emergency fleets — built panel by panel, start to finish.</p>
+</section>
 
 <div class="page">
 
@@ -998,6 +1055,50 @@
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   });
+</script>
+
+<!-- Intro reveal — purely decorative, separate from the app logic above.
+     Keeps a --intro-progress CSS variable in sync with actual scroll
+     position (0 = at the title card, 1 = fully scrolled past it) so
+     the card's slide-left and the sidebar's slide-in read as one
+     connected motion instead of two things happening near each other.
+     Also toggles a class purely to gate the sidebar's pointer-events
+     while the card is still on screen. The sidebar's default (no-JS)
+     state is fully visible, so this only ever adds an enhancement,
+     never removes functionality — plain scroll, no scroll-jacking. -->
+<script>
+(function(){
+  var intro = document.querySelector('.intro');
+  if(!intro) return;
+
+  if('IntersectionObserver' in window){
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(entry){
+        document.body.classList.toggle('intro-visible', entry.isIntersecting);
+      });
+    }, { threshold: 0 });
+    io.observe(intro);
+  }
+
+  var root = document.documentElement;
+  var ticking = false;
+  function update(){
+    ticking = false;
+    var rect = intro.getBoundingClientRect();
+    // Resolves within the first third of the card's own height so the
+    // two layers cross-fade quickly rather than ghosting into each
+    // other for a full screen-height of scrolling.
+    var p = rect.height ? -rect.top / (rect.height * 0.14) : 0;
+    p = Math.max(0, Math.min(1, p));
+    root.style.setProperty('--intro-progress', p);
+  }
+  function onScroll(){
+    if(!ticking){ ticking = true; requestAnimationFrame(update); }
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll);
+  update();
+})();
 </script>
 </body>
 </html>
